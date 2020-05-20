@@ -1,4 +1,4 @@
-# Copyright 2001-2017 by Vinay Sajip. All Rights Reserved.
+# Copyright 2001-2016 by Vinay Sajip. All Rights Reserved.
 #
 # Permission to use, copy, modify, and distribute this software and its
 # documentation for any purpose and without fee is hereby granted,
@@ -18,12 +18,12 @@
 Logging package for Python. Based on PEP 282 and comments thereto in
 comp.lang.python.
 
-Copyright (C) 2001-2017 Vinay Sajip. All Rights Reserved.
+Copyright (C) 2001-2016 Vinay Sajip. All Rights Reserved.
 
 To use, simply 'import logging' and log away!
 """
 
-import sys, os, time, io, traceback, warnings, weakref, collections.abc
+import sys, os, time, io, traceback, warnings, weakref, collections
 
 from string import Template
 
@@ -37,7 +37,10 @@ __all__ = ['BASIC_FORMAT', 'BufferingFormatter', 'CRITICAL', 'DEBUG', 'ERROR',
            'warn', 'warning', 'getLogRecordFactory', 'setLogRecordFactory',
            'lastResort', 'raiseExceptions']
 
-import threading
+try:
+    import threading
+except ImportError: #pragma: no cover
+    threading = None
 
 __author__  = "Vinay Sajip <vinay_sajip@red-dove.com>"
 __status__  = "production"
@@ -59,6 +62,7 @@ _startTime = time.time()
 #propagated
 #
 raiseExceptions = True
+from threading import Thread
 
 #
 # If you don't want threading information in the log, set this to zero
@@ -151,7 +155,7 @@ def addLevelName(level, levelName):
         _releaseLock()
 
 if hasattr(sys, '_getframe'):
-    currentframe = lambda: sys._getframe(3)
+    currentframe = lambda: sys._getframe(4)
 else: #pragma: no cover
     def currentframe():
         """Return the frame object for the caller's stack frame."""
@@ -207,7 +211,11 @@ def _checkLevel(level):
 #the lock would already have been acquired - so we need an RLock.
 #The same argument applies to Loggers and Manager.loggerDict.
 #
-_lock = threading.RLock()
+if threading:
+    _lock = threading.RLock()
+else: #pragma: no cover
+    _lock = None
+
 
 def _acquireLock():
     """
@@ -224,44 +232,6 @@ def _releaseLock():
     """
     if _lock:
         _lock.release()
-
-
-# Prevent a held logging lock from blocking a child from logging.
-
-if not hasattr(os, 'register_at_fork'):  # Windows and friends.
-    def _register_at_fork_reinit_lock(instance):
-        pass  # no-op when os.register_at_fork does not exist.
-else:
-    # A collection of instances with a createLock method (logging.Handler)
-    # to be called in the child after forking.  The weakref avoids us keeping
-    # discarded Handler instances alive.  A set is used to avoid accumulating
-    # duplicate registrations as createLock() is responsible for registering
-    # a new Handler instance with this set in the first place.
-    _at_fork_reinit_lock_weakset = weakref.WeakSet()
-
-    def _register_at_fork_reinit_lock(instance):
-        _acquireLock()
-        try:
-            _at_fork_reinit_lock_weakset.add(instance)
-        finally:
-            _releaseLock()
-
-    def _after_at_fork_child_reinit_locks():
-        # _acquireLock() was called in the parent before forking.
-        for handler in _at_fork_reinit_lock_weakset:
-            try:
-                handler.createLock()
-            except Exception as err:
-                # Similar to what PyErr_WriteUnraisable does.
-                print("Ignoring exception from logging atfork", instance,
-                      "._reinit_lock() method:", err, file=sys.stderr)
-        _releaseLock()  # Acquired by os.register_at_fork(before=.
-
-
-    os.register_at_fork(before=_acquireLock,
-                        after_in_child=_after_at_fork_child_reinit_locks,
-                        after_in_parent=_releaseLock)
-
 
 #---------------------------------------------------------------------------
 #   The logging record
@@ -304,8 +274,8 @@ class LogRecord(object):
         # to hasattr(args[0], '__getitem__'). However, the docs on string
         # formatting still seem to suggest a mapping object is required.
         # Thus, while not removing the isinstance check, it does now look
-        # for collections.abc.Mapping rather than, as before, dict.
-        if (args and len(args) == 1 and isinstance(args[0], collections.abc.Mapping)
+        # for collections.Mapping rather than, as before, dict.
+        if (args and len(args) == 1 and isinstance(args[0], collections.Mapping)
             and args[0]):
             args = args[0]
         self.args = args
@@ -326,7 +296,7 @@ class LogRecord(object):
         self.created = ct
         self.msecs = (ct - int(ct)) * 1000
         self.relativeCreated = (self.created - _startTime) * 1000
-        if logThreads:
+        if logThreads and threading:
             self.thread = threading.get_ident()
             self.threadName = threading.current_thread().name
         else: # pragma: no cover
@@ -832,22 +802,27 @@ class Handler(Filterer):
         """
         Acquire a thread lock for serializing access to the underlying I/O.
         """
-        self.lock = threading.RLock()
-        _register_at_fork_reinit_lock(self)
+        if threading:
+            self.lock = threading.RLock()
+        else: #pragma: no cover
+            self.lock = None
 
     def acquire(self):
         """
         Acquire the I/O thread lock.
         """
         if self.lock:
-            self.lock.acquire()
+            self.lock.acquire(timeout=0.05)
 
     def release(self):
         """
         Release the I/O thread lock.
         """
         if self.lock:
-            self.lock.release()
+            try:
+                self.lock.release()
+            except:
+                pass
 
     def setLevel(self, level):
         """
@@ -963,8 +938,6 @@ class Handler(Filterer):
                     sys.stderr.write('Message: %r\n'
                                      'Arguments: %s\n' % (record.msg,
                                                           record.args))
-                except RecursionError:  # See issue 36272
-                    raise
                 except Exception:
                     sys.stderr.write('Unable to print the message and arguments'
                                      ' - possible formatting error.\nUse the'
@@ -1024,39 +997,15 @@ class StreamHandler(Handler):
         try:
             msg = self.format(record)
             stream = self.stream
-            # issue 35046: merged two stream.writes into one.
-            stream.write(msg + self.terminator)
+            stream.write(msg)
+            stream.write(self.terminator)
             self.flush()
-        except RecursionError:  # See issue 36272
-            raise
         except Exception:
             self.handleError(record)
-
-    def setStream(self, stream):
-        """
-        Sets the StreamHandler's stream to the specified value,
-        if it is different.
-
-        Returns the old stream, if the stream was changed, or None
-        if it wasn't.
-        """
-        if stream is self.stream:
-            result = None
-        else:
-            result = self.stream
-            self.acquire()
-            try:
-                self.flush()
-                self.stream = stream
-            finally:
-                self.release()
-        return result
 
     def __repr__(self):
         level = getLevelName(self.level)
         name = getattr(self.stream, 'name', '')
-        #  bpo-36015: name can be an int
-        name = str(name)
         if name:
             name += ' '
         return '<%s %s(%s)>' % (self.__class__.__name__, name, level)
@@ -1301,19 +1250,6 @@ class Manager(object):
                 alogger.parent = c.parent
                 c.parent = alogger
 
-    def _clear_cache(self):
-        """
-        Clear the cache for all loggers in loggerDict
-        Called when level changes are made
-        """
-
-        _acquireLock()
-        for logger in self.loggerDict.values():
-            if isinstance(logger, Logger):
-                logger._cache.clear()
-        self.root._cache.clear()
-        _releaseLock()
-
 #---------------------------------------------------------------------------
 #   Logger classes and functions
 #---------------------------------------------------------------------------
@@ -1344,14 +1280,13 @@ class Logger(Filterer):
         self.propagate = True
         self.handlers = []
         self.disabled = False
-        self._cache = {}
-
+        #add new filed log message
+        self.recordmessage = None
     def setLevel(self, level):
         """
         Set the logging level of this logger.  level must be an int or a str.
         """
         self.level = _checkLevel(level)
-        self.manager._clear_cache()
 
     def debug(self, msg, *args, **kwargs):
         """
@@ -1511,6 +1446,9 @@ class Logger(Filterer):
                 exc_info = sys.exc_info()
         record = self.makeRecord(self.name, level, fn, lno, msg, args,
                                  exc_info, func, extra, sinfo)
+        #add new field
+        self.recordmessage = "[{0}]: {1}".format(record.levelname[0],msg)
+        # self.recordmessage = "[{0}][line:{1}][{2}]: {3}".format(os.path.split(fn)[-1], lno, record.levelname[0], msg)
         self.handle(record)
 
     def handle(self, record):
@@ -1615,17 +1553,9 @@ class Logger(Filterer):
         """
         Is this logger enabled for level 'level'?
         """
-        try:
-            return self._cache[level]
-        except KeyError:
-            _acquireLock()
-            if self.manager.disable >= level:
-                is_enabled = self._cache[level] = False
-            else:
-                is_enabled = self._cache[level] = level >= self.getEffectiveLevel()
-            _releaseLock()
-
-            return is_enabled
+        if self.manager.disable >= level:
+            return False
+        return level >= self.getEffectiveLevel()
 
     def getChild(self, suffix):
         """
@@ -1650,14 +1580,6 @@ class Logger(Filterer):
         level = getLevelName(self.getEffectiveLevel())
         return '<%s %s (%s)>' % (self.__class__.__name__, self.name, level)
 
-    def __reduce__(self):
-        # In general, only the root logger will not be accessible via its name.
-        # However, the root logger's class has its own __reduce__ method.
-        if getLogger(self.name) is not self:
-            import pickle
-            raise pickle.PicklingError('logger cannot be pickled')
-        return getLogger, (self.name,)
-
 
 class RootLogger(Logger):
     """
@@ -1670,9 +1592,6 @@ class RootLogger(Logger):
         Initialize the logger with the name "root".
         """
         Logger.__init__(self, "root", level)
-
-    def __reduce__(self):
-        return getLogger, ()
 
 _loggerClass = Logger
 
@@ -1766,7 +1685,9 @@ class LoggerAdapter(object):
         """
         Is this logger enabled for level 'level'?
         """
-        return self.logger.isEnabledFor(level)
+        if self.logger.manager.disable >= level:
+            return False
+        return level >= self.getEffectiveLevel()
 
     def setLevel(self, level):
         """
@@ -2008,12 +1929,11 @@ def log(level, msg, *args, **kwargs):
         basicConfig()
     root.log(level, msg, *args, **kwargs)
 
-def disable(level=CRITICAL):
+def disable(level):
     """
     Disable all logging calls of severity 'level' and below.
     """
     root.manager.disable = level
-    root.manager._clear_cache()
 
 def shutdown(handlerList=_handlerList):
     """
