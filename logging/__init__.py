@@ -239,6 +239,9 @@ def _releaseLock():
 
 class LogRecord(object):
     """
+    lyt: 封装日志内容的数据项，比如每行日志可能需要获取该函数的堆栈、线程name等元信息。
+    Formatter将会调用此对象的数据来格式化成可输出内容
+
     A LogRecord instance represents an event being logged.
 
     LogRecord instances are created every time something is logged. They
@@ -1465,6 +1468,7 @@ class Logger(Filterer):
         """
         Add the specified handler to this logger.
         """
+        # lyt: 如果self.handlers使用set(), 是否可以避免锁?
         _acquireLock()
         try:
             if not (hdlr in self.handlers):
